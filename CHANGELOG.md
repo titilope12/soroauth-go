@@ -10,6 +10,68 @@ this project adheres to
 
 ### Added
 
+- Publish `@soroauth/node` from a version tag with a prebuilt bindings pair for
+  `linux-x64`, `linux-arm64`, `darwin-x64` and `darwin-arm64`, so `npm install`
+  no longer needs a Go toolchain. Publishing is tag-gated and carries npm
+  provenance, and the tarball is refused unless every platform pair is present
+  and each binary matches the architecture its directory names. Installing on a
+  platform without a prebuild still falls back to the source build, and CI
+  exercises that fallback as well as the prebuild path.
+- `HostRules` enumerates every rule the Soroban host enforces on an
+  authorization entry, each with its `rs-soroban-env` source citation, and marks
+  the rules that cannot be checked offline with the reason instead of omitting
+  them. `ValidateEntry` checks every offline rule in one place — delegate order
+  and uniqueness, delegate depth, value depth, map key order in the host's value
+  order (not XDR byte order), value and symbol form, address types, the classic
+  multisig vector, and create-contract authorization — and reports a violation
+  as a `*HostRuleError` that matches the new `ErrHostRuleViolation`.
+  `AuthorizeEntry` and `StreamingSign` run it before any signer is called and
+  again on the signed result. [docs/host-rules.md](docs/host-rules.md) is the
+  documented copy, and a test fails if it and the code disagree. (#623)
+- The delegate tree depth limit is established from the host source and
+  enforced: the host reads a delegate at depth k only when k + 1 +
+  depth(signature) <= 100 (98 levels with Void signatures, 96 with ed25519), and
+  soroauth applies one policy, `MaxDelegateDepth = 54`, the deepest fully signed
+  tree its own bounded decoder can read back. `WithDelegates`, `ValidateEntry`,
+  `AuthorizeEntry` and `StreamingSign` refuse a deeper tree with the new
+  `ErrDelegateDepthLimit` before signing. The host has no breadth limit; the
+  per-delegate resource cost is measured and documented instead.
+  `testdata/host-probe` (`make host-probe`) measures every boundary against the
+  real soroban-env-host 30.0.1, and e2e scenarios S, S-host and S-over confirm
+  them on testnet. (#622)
+
+- Add five AST-based repository invariant linters (`NoPanic`, `NoLogging`,
+  `NoMathRand`, `NoFloats`, `NoMutation`) in `internal/invariants`, each with
+  violating and compliant test fixtures and an exemption directive
+  (`// invariant-allow: <rule> <reason>`). A root-level test runs all analyzers
+  across the full repo tree. (#627)
+
+- Load custom risk rules from JSON or YAML configuration via `LoadRiskRules`,
+  evaluated alongside built-in heuristics. Four rule types are supported:
+  `contract_allowlist`, `function_allowlist`, `max_amount` and
+  `forbidden_sac_admin`. Malformed rules fail at load time naming the offending
+  rule, and configured rules cannot suppress built-in findings. (#626)
+
+- Add `VerifyInvocationTree` to compare the library's invocation tree against
+  the host's reported tree structurally. A divergence reports the exact path
+  where the trees differ. Comparison covers function type, contract address,
+  function name, arguments and sub-invocations recursively at arbitrary depth.
+  (#625)
+
+- Audit every address-handling site for muxed account behaviour. Muxed addresses
+  in invocation arguments are now reported in full (`M…` strkey) via
+  `FormatArgumentAddress` and `FormatScVal`, never truncated to the underlying
+  account. The canonical JSON encoder/decoder round-trips the `muxed_account`
+  type, and credentials still refuse muxed addresses unchanged. (#624)
+
+- `examples/opentelemetry` traces the whole `rpcflow.SignAndSubmit` flow as one
+  OpenTelemetry trace: record pass, signing, enforcing pass, submission and
+  polling, with the two passes' resource fees and their difference as
+  attributes. It wraps `rpcflow.Client` and each `soroauth.Signer` rather than
+  forking the flow, lives in its own module so OpenTelemetry never enters the
+  root `go.mod`, ships `cmd/trace-transfer` for testnet with a real captured
+  trace in its README, and asserts that no span carries a secret, an entry or a
+  signature. (#422)
 - Add a per-caller token-bucket rate limit to the verification service, checked
   before the body is read and before a concurrency slot is taken. A refusal is
   `429` with `Retry-After`; `AUTH_TOKEN` accepts a comma-separated list so
@@ -141,6 +203,12 @@ this project adheres to
 
 ### Fixed
 
+- The `delegates_chain_depth_57` golden vector claimed to be the deepest
+  delegate nesting the library accepts end to end, but soroauth signed that
+  chain and then refused to decode its own output: signing the leaf adds three
+  levels of XDR nesting. The vector is regenerated at depth 54
+  (`delegates_chain_depth_54`), the deepest signed chain that decodes, and a
+  test decodes its signed entry. No emitted bytes change. (#622)
 - Document the intermittent macOS crash in the Node binding under `node:test` in
   `bindings/node/README.md`: Go's cgo entry reuses the g0 stack bounds recorded
   on an earlier entry, so being re-entered on another thread trips
@@ -218,6 +286,21 @@ this project adheres to
 
 ### Changed
 
+- `AuthorizeEntry` and `StreamingSign` now refuse, with `ErrHostRuleViolation`,
+  an entry or a signature the host would refuse for its ordering or canonical
+  form — including a signature on a classic `G…` node that is not the account
+  signature vector, which the host cannot accept. `WithDelegates` refuses a tree
+  deeper than `MaxDelegateDepth` (54) rather than 64; that refusal still matches
+  `ErrDecodeLimit`. `ValidateDelegateOrder` errors are now `*HostRuleError`s
+  with unchanged messages. The CLI reports the new sentinels as
+  `delegate_depth_limit` and `host_rule_violation` and exits with the
+  signing-refusal code. (#622, #623)
+- `soroauth explain-error` now exits 1 when the entry decodes but cannot be
+  inspected (for example, a muxed credential address), in text mode as well as
+  with `--json`. Text mode used to print the error and exit 0, and the `--json`
+  exit 1 was undocumented; the code is now listed in `explain-error -h`. Found
+  by the new test that holds every documented exit code to the implementation.
+  (#669)
 - **C shared-library ABI** (`bindings/c`) builds the signing core as a
   `c-shared` library and exposes the authorization operations and typed errors
   through a JSON-based C interface. (#339)
@@ -236,8 +319,12 @@ this project adheres to
   defaults. (#388)
 
 - **The minimum Go version is now 1.26.3** (was 1.25.0). `go.mod`, every
-  `adapters/*/go.mod`, the README and CONTRIBUTING name the same version, and
-  the `toolchain` line is restored so builds resolve one compiler.
+  `adapters/*/go.mod`, the README and CONTRIBUTING name the same version, and no
+  `toolchain` line is present. `go mod tidy` removes a `toolchain` line that
+  equals the `go` directive and keeps one that names a higher version, so with
+  both at 1.26.3 the `go` directive alone selects the compiler. An earlier entry
+  here claimed the line was "restored"; it was not, and could not be while the
+  two versions match. (#517)
 
   The move was forced, not chosen: `github.com/prometheus/client_golang` v1.25.0
   declares `go 1.26.0`, and a module cannot require less than its dependencies.
@@ -510,6 +597,51 @@ this project adheres to
   than only on who signed. Test fixture code, not a product: no policies beyond
   the one limit, no upgradability, not for mainnet. Two e2e scenarios drive it
   against a live host, one within the limit and one over it. (#72)
+
+### Fixed
+
+- **`scripts/gen-formula.sh` lost its executable bit**, which broke
+  `ci / packaging`'s homebrew jobs on both runners with exit 126 and would have
+  broken the next release. #480 changed the file's mode from `100755` to
+  `100644` with no change to its contents — the blob hash is identical either
+  side — and the two callers that run it directly,
+  `.github/workflows/ci-packaging.yml` and `.github/workflows/release.yml`, then
+  failed with `scripts/gen-formula.sh: Permission denied`. The bit is restored.
+  (`.github/scripts/record-tool-versions.sh` is also mode `100644`, but every
+  one of its call sites invokes it as `bash <script>`, so its mode does not
+  matter.) (#480)
+
+- The daily **CI cost report** never produced a report. The step read
+  `${GITHUB_TOKEN}` under `set -u`, which is unset by default, so it failed on
+  its first line every run; it also read the REST response
+  `{total_count, workflow_runs: [...]}` as an array, so `jq length` returned 2
+  (the key count) and the loop read a number and an array as if they were runs,
+  and it summed a `duration_in_seconds` field that endpoint does not return. It
+  now passes `github.token` as `GH_TOKEN`, lists runs with `gh run list --json`,
+  and derives each run's wall-clock minutes from `startedAt`/`updatedAt`. The
+  summary says plainly that this is elapsed time, not billed runner minutes. Its
+  artifact step also uploaded `.github/workflows/cost-report.yml` — the workflow
+  file, not any report — and was the one action in the repository pinned to a
+  mutable tag rather than a commit SHA. It now uploads `report.tsv` and is
+  pinned like the rest. (#508)
+
+- The **reproducible** workflow's "record tool versions" step ran
+  `.github/scripts/record-tool-versions.sh` from a checkout of the _released
+  tag_, where that script does not exist, so it exited 127 on every release
+  there is. The step is now guarded and records the versions inline when the
+  script is absent. (#475)
+
+- The **Nix flake check** failed every exec-signer test with exit 127. The
+  helper script those tests write pipes its input through `cat`, and the build
+  sandbox carries no coreutils on `PATH`. `coreutils` is now in
+  `nativeCheckInputs` and on the check's `PATH`. This is a different failure
+  from the shebang one fixed in #494, and was only reachable once that was out
+  of the way. (#494, #517)
+
+- `adapters/awskms`, `adapters/gcpkms` and `adapters/walletsdk` were untidy, and
+  four entries in `testdata/coverage/floors.json` named floors that CI never
+  met. Both are now consistent with what the tree actually builds and measures.
+  (#517)
 
 ### Added
 

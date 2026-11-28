@@ -54,9 +54,14 @@ a native binary is not possible at all.
 
 ## Install
 
-Published packages carry a prebuilt pair per platform under
+Published packages carry a prebuilt pair for every supported platform under
 `prebuilds/<os>-<arch>/` (the Go shared library and the N-API addon), so a plain
-`npm install` needs no toolchain.
+`npm install` needs no Go toolchain and no C toolchain. The tarball also carries
+`scripts/install.mjs`, which checks for the prebuild before doing anything else.
+
+```sh
+npm install @soroauth/node
+```
 
 From a checkout of the repository, build it yourself:
 
@@ -74,23 +79,55 @@ never look like one that signed something.
 
 ## Prebuilds
 
-| OS    | Architecture    | Node               |
-| ----- | --------------- | ------------------ |
-| Linux | x86_64, aarch64 | 22, 24 (see below) |
-| macOS | arm64, x86_64   | 22, 24 (see below) |
+| `prebuilds/` directory | OS    | Architecture | Built on           |
+| ---------------------- | ----- | ------------ | ------------------ |
+| `linux-x64`            | Linux | x86_64       | `ubuntu-latest`    |
+| `linux-arm64`          | Linux | arm64        | `ubuntu-24.04-arm` |
+| `darwin-x64`           | macOS | x86_64       | `macos-15-intel`   |
+| `darwin-arm64`         | macOS | arm64        | `macos-15`         |
 
-The addon is N-API (`node_api.h`), whose ABI is stable across Node versions:
-that is why one binary can serve every supported Node rather than one per
-version. CI builds and tests the pair on each row of the matrix
-(`.github/workflows/ci-node.yml`) and uploads each platform's `prebuilds/`
-directory as an artifact; the release workflow assembles them into the published
-tarball.
+Each directory holds `soroauth.node` (the N-API addon) and
+`libsoroauth.so`/`libsoroauth.dylib` (the Go signing core). The addon is N-API
+(`node_api.h`), whose ABI is stable across Node versions: that is why one binary
+serves every supported Node rather than one per version.
+
+`ci-node.yml` builds and tests the pair on every row above and uploads one
+`node-prebuild-<platform>` artifact per platform. `release.yml` calls that same
+workflow on the tagged commit, refuses to publish unless all four directories
+are present, checks each binary's header to confirm it is the architecture its
+directory claims, and then packs them into the published tarball. Publishing is
+tag-gated and carries npm provenance, matching `@soroauth/wasm`.
+
+`node scripts/verify-prebuilds.mjs [dir] [--platform NAME]... [--tarball pack.json]`
+performs the same layout and binary-format check locally. With no `--platform`
+it requires all four, which is the release gate; pass the one directory a local
+build produced (for example `--platform linux-x64`) to check just that pair.
+
+**Linux prebuilds are glibc builds.** Alpine/musl has no matching prebuild and
+falls back to a source build, which needs the Go toolchain. The same applies to
+any platform not listed above.
 
 The source build additionally needs `node-gyp`'s own Node floor (^22.22.2 ||
 ^24.15.0 || >=26 at the version pinned in `devDependencies`).
 
 Windows is not supported: the binding loads the Go shared library with `dlopen`
 and this repository builds `c-shared` only for Linux and macOS.
+
+### Known issue: macOS under `node:test`
+
+On macOS, running this package's own test suite under `node:test` crashes
+intermittently inside the Go runtime with `fatal error: morestack on g0` — about
+5 clean runs in 24 measured, on both Node 22 and 24. Linux is unaffected. The
+cause is Go's cgo entry reusing g0 stack bounds recorded on a different thread;
+see #518 for the full measurements and traces, and
+[golang/go#59294](https://github.com/golang/go/issues/59294) for the mechanism.
+
+The same calls made from an ordinary script, including from 200 frames deep
+inside promise continuations, were clean across 44 runs, so the binding itself
+looks sound and only the `node:test` harness has been observed to trigger it.
+That is evidence rather than a guarantee: if you hit this outside `node:test`,
+please add it to #518. `ci / node` is red on macOS for this reason and is not a
+required check.
 
 ## API
 
